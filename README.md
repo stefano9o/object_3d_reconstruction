@@ -1,5 +1,5 @@
 # Object-3d reconstruction
-## Final project for the exam "Transactional systems and data mining" prepared in 7/2014
+## Final project for the exam "Transactional systems and data mining" prepared in 3/2014
 
 ## Description
 Using Kinect device and PCL (Point Cloud Library) for the reconstruction of 3d objects
