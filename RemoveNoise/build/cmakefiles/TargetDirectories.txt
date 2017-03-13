@@ -1,0 +1,1 @@
+/home/parallels/Desktop/Reconstruction3D/RemoveNoise/build/CMakeFiles/removeNoise.dir

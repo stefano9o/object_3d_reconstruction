@@ -1,0 +1,1 @@
+/home/parallels/Desktop/Reconstruction3D/Viewer/build/CMakeFiles/cloudViewer.dir

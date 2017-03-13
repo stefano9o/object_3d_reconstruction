@@ -1,0 +1,404 @@
+#include <boost/make_shared.hpp>
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_representation.h>
+
+#include <Eigen/Core>
+
+#include <pcl/io/pcd_io.h>
+
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/filter.h>
+
+#include <pcl/features/normal_3d.h>
+
+#include <pcl/registration/icp.h>
+#include <pcl/registration/icp_nl.h>
+#include <pcl/registration/transforms.h>
+
+#include <pcl/visualization/pcl_visualizer.h>
+
+using pcl::visualization::PointCloudColorHandlerGenericField;
+using pcl::visualization::PointCloudColorHandlerCustom;
+
+//convenient typedefs
+typedef pcl::PointXYZ PointT;
+typedef pcl::PointCloud<PointT> PointCloud;
+typedef pcl::PointNormal PointNormalT;
+typedef pcl::PointCloud<PointNormalT> PointCloudWithNormals;
+
+// This is a tutorial so we can afford having global variables 
+	//our visualizervisualizzare matrice  rotate pcl
+	pcl::visualization::PCLVisualizer *p;
+	//its left and right viewports
+	int vp_1, vp_2;
+
+//convenient structure to handle our pointclouds
+struct PCD
+{
+  PointCloud::Ptr cloud;
+  std::string f_name;
+
+  PCD() : cloud (new PointCloud) {};
+};
+
+struct PCDComparator
+{
+  bool operator () (const PCD& p1, const PCD& p2)
+  {
+    return (p1.f_name < p2.f_name);
+  }
+};
+
+// Define a new point representation for < x, y, z, curvature >
+class MyPointRepresentation : public pcl::PointRepresentation <PointNormalT>
+{
+  using pcl::PointRepresentation<PointNormalT>::nr_dimensions_;
+public:
+  MyPointRepresentation ()
+  {
+    // Define the number of dimensions
+    nr_dimensions_ = 4;
+  }
+
+  // Override the copyToFloatArray method to define our feature vector
+  virtual void copyToFloatArray (const PointNormalT &p, float * out) const
+  {
+    // < x, y, z, curvature >
+    out[0] = p.x;
+    out[1] = p.y;
+    out[2] = p.z;
+    out[3] = p.curvature;
+  }
+};
+
+////////////////////////////////////////////////////////////////////////////////
+/** \brief Display source and target on the first viewport of the visualizer
+ *
+ */
+void showCloudsLeft(const PointCloud::Ptr cloud_target, const PointCloud::Ptr cloud_source)
+{
+  p->removePointCloud ("vp1_target");
+  p->removePointCloud ("vp1_source");
+  
+  p->setBackgroundColor (1.0,1.0,1.0, 0);
+
+  PointCloudColorHandlerCustom<PointT> tgt_h (cloud_target, 0, 255, 0);
+  PointCloudColorHandlerCustom<PointT> src_h (cloud_source, 255, 0, 0);
+  p->addPointCloud (cloud_target, tgt_h, "vp1_target", vp_1);
+  p->addPointCloud (cloud_source, src_h, "vp1_source", vp_1);
+
+  PCL_INFO ("Press q to begin the registration.\n");
+  p-> spin();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/** \brief Display source and target on the second viewport of the visualizer
+ *
+ */
+void showCloudsRight(const PointCloudWithNormals::Ptr cloud_target, const PointCloudWithNormals::Ptr cloud_source)
+{
+  p->removePointCloud ("source");
+  p->removePointCloud ("target");
+
+  p->setBackgroundColor (1.0,1.0,1.0, 0);
+
+  PointCloudColorHandlerGenericField<PointNormalT> tgt_color_handler (cloud_target, "curvature");
+  if (!tgt_color_handler.isCapable ())
+      PCL_WARN ("Cannot create curvature color handler!");
+
+  PointCloudColorHandlerGenericField<PointNormalT> src_color_handler (cloud_source, "curvature");
+  if (!src_color_handler.isCapable ())
+      PCL_WARN ("Cannot create curvature color handler!");
+
+
+  p->addPointCloud (cloud_target, tgt_color_handler, "target", vp_2);
+  p->addPointCloud (cloud_source, src_color_handler, "source", vp_2);
+
+  p->spinOnce();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/** \brief Load a set of PCD files that we want to register together
+  * \param argc the number of arguments (pass from main ())
+  * \param argv the actual command line arguments (pass from main ())
+  * \param models the resultant vector of point cloud datasets
+  */
+void loadData (int argc, char **argv, std::vector<PCD, Eigen::aligned_allocator<PCD> > &models)
+{
+  std::string extension (".pcd");
+  // Suppose the first argument is the actual test model
+  for (int i = 1; i < argc; i++)
+  {
+    std::string fname = std::string (argv[i]);
+    // Needs to be at least 5: .plot
+    if (fname.size () <= extension.size ())
+      continue;
+
+    std::transform (fname.begin (), fname.end (), fname.begin (), (int(*)(int))tolower);
+
+    //check that the argument is a pcd file
+    if (fname.compare (fname.size () - extension.size (), extension.size (), extension) == 0)
+    {
+      // Load the cloud and saves it into the global list of models
+      PCD m;
+      m.f_name = argv[i];
+      pcl::io::loadPCDFile (argv[i], *m.cloud);
+      //remove NAN points from the cloud
+      std::vector<int> indices;
+      pcl::removeNaNFromPointCloud(*m.cloud,*m.cloud, indices);
+
+      models.push_back (m);
+    }
+  }
+}
+////////////////////////////////////////////////////////////////////////////////
+/** \brief Align a pair of PointCloud datasets and return the result
+  * \param cloud_src the source PointCloud
+  * \param cloud_tgt the target PointCloud
+  * \param output the resultant aligned source PointCloud
+  */
+void pairAlign (const PointCloud::Ptr cloud_src, const PointCloud::Ptr cloud_tgt, PointCloud::Ptr output, bool downsample = false)
+{
+  // Downsample for consistency and speed
+  // \note enable this for large datasets
+  PointCloud::Ptr src (new PointCloud);
+  PointCloud::Ptr tgt (new PointCloud);
+  pcl::VoxelGrid<PointT> grid;
+  if (downsample) //se vera diminuisce il numero di punti
+  {
+    grid.setLeafSize (0.05, 0.05, 0.05);
+    grid.setInputCloud (cloud_src);
+    grid.filter (*src);
+
+    grid.setInputCloud (cloud_tgt);
+    grid.filter (*tgt);
+  }
+  else
+  {
+    src = cloud_src;
+    tgt = cloud_tgt;
+  }
+   Eigen::Matrix4f Ti = Eigen::Matrix4f::Identity ();
+   //Calcolo il baricentro della nuvola di punti per oterla ruotare attorno al suo asse principale
+   float tempX = 0, tempY = 0, tempZ = 0;
+   float middleX, middleY, middleZ;
+	for(size_t k = 0; k < src->points.size (); ++k){
+   	  tempX = tempX + src->points[k].x;
+      tempY = tempY + src->points[k].y;
+      tempZ = tempZ + src->points[k].z;
+	}
+	middleX = tempX / src->points.size ();
+    middleY = tempY / src->points.size ();
+    middleZ = tempZ / src->points.size ();
+
+    //Ruoto la matrice source di circa 45 gradi per effettuare meno allineamenti e meno iterazioni
+
+	Eigen::Matrix4f zeroT;
+			zeroT <<      1, 0, 0, -middleX,
+ 		      			  0, 1, 0, -middleY,
+  				          0, 0, 1, -middleZ,
+   			              0, 0, 0, 	     1;
+	Eigen::Matrix4f degree45;
+			//AsseY
+  			degree45 <<   cos(-45), 0, sin(-45),       0,
+								 0, 1,        0,       0,
+ 		      			 -sin(-45), 0, cos(-45),       0,
+  				                 0, 0,        0,       1;
+ 	Eigen::Matrix4f tZero;
+			tZero <<      1, 0, 0, middleX,
+ 		      			  0, 1, 0, middleY,
+  				          0, 0, 1, middleZ,
+   			              0, 0, 0, 		 1;
+  
+  pcl::transformPointCloud (*src, *src, zeroT); 
+  pcl::transformPointCloud (*src, *src, degree45);
+  pcl::transformPointCloud (*src, *src, tZero);
+  Ti = zeroT * Ti;
+  Ti = degree45 * Ti;
+  Ti = tZero * Ti;
+
+  // Compute surface normals and curvature
+  PointCloudWithNormals::Ptr points_with_normals_src (new PointCloudWithNormals);
+  PointCloudWithNormals::Ptr points_with_normals_tgt (new PointCloudWithNormals);
+
+  pcl::NormalEstimation<PointT, PointNormalT> norm_est;
+  pcl::search::KdTree<pcl::PointXYZ>::Ptr tree (new pcl::search::KdTree<pcl::PointXYZ> ());
+  norm_est.setSearchMethod (tree);
+  norm_est.setKSearch (100);
+  
+  norm_est.setInputCloud (src);
+  norm_est.compute (*points_with_normals_src);
+  pcl::copyPointCloud (*src, *points_with_normals_src);
+
+  norm_est.setInputCloud (tgt);
+  norm_est.compute (*points_with_normals_tgt);
+  pcl::copyPointCloud (*tgt, *points_with_normals_tgt);
+
+  //
+  // Instantiate our custom point representation (defined above) ...
+  MyPointRepresentation point_representation;
+  // ... and weight the 'curvature' dimension so that it is balanced against x, y, and z
+  float alpha[4] = {1.0, 1.0, 1.0, 1.0};
+  point_representation.setRescaleValues (alpha);
+
+  // ALLINEAMENTO
+  // Align
+  pcl::IterativeClosestPointNonLinear<PointNormalT, PointNormalT> reg;
+  reg.setTransformationEpsilon (1e-6);
+  // Set the maximum distance between two correspondences (src<->tgt) to 10cm
+  // Note: adjust this based on the size of your datasets
+  reg.setMaxCorrespondenceDistance (0.1);  
+  // Set the point representation
+  reg.setPointRepresentation (boost::make_shared<const MyPointRepresentation> (point_representation));
+
+  reg.setInputCloud (points_with_normals_src);
+  reg.setInputTarget (points_with_normals_tgt);
+
+  // Run the same optimization in a loop and visualize the results
+  Eigen::Matrix4f prev;
+  Eigen::Matrix4f targetToSource;
+  PointCloudWithNormals::Ptr reg_result = points_with_normals_src;
+  reg.setMaximumIterations (2);
+  for (int i = 0; i < 150; ++i) //Aumentando le iterazioni divento molto piu preciso nell'allineare gli oggetti con 1000 si hanno buoni risultati
+  {
+    PCL_INFO ("Iteration Nr. %d.\n", i);
+
+    // save cloud for visualization purpose
+    points_with_normals_src = reg_result;
+
+    // Estimate
+    reg.setInputCloud (points_with_normals_src);
+    reg.align (*reg_result);
+
+		//accumulate transformation between each Iteration
+    Ti = reg.getFinalTransformation () * Ti;
+
+		//if the difference between this transformation and the previous one
+		//is smaller than the threshold, refine the process by reducing
+		//the maximal correspondence distance
+    if (fabs ((reg.getLastIncrementalTransformation () - prev).sum ()) < reg.getTransformationEpsilon ())
+      reg.setMaxCorrespondenceDistance (reg.getMaxCorrespondenceDistance () - 0.001);
+    
+    prev = reg.getLastIncrementalTransformation ();
+
+    // visualize current state
+    showCloudsRight(points_with_normals_tgt, points_with_normals_src);
+  }
+  std::cout <<"Trasformation Source-Target Matrix\n"<< Ti << endl;
+  // Get the transformation from target to source
+  targetToSource = Ti.inverse();
+
+  // Transform target back in source frame
+  pcl::transformPointCloud (*cloud_tgt, *output, targetToSource);
+
+  p->removePointCloud ("source");
+  p->removePointCloud ("target");
+  
+  p->setBackgroundColor (1.0,1.0,1.0, 0);
+
+  PointCloudColorHandlerCustom<PointT> cloud_tgt_h (output, 0, 255, 0); //Coloro di verde il target
+  PointCloudColorHandlerCustom<PointT> cloud_src_h (cloud_src, 255, 0, 0); //Coloro di rosso la source
+  p->addPointCloud (output, cloud_tgt_h, "target", vp_2);
+  p->addPointCloud (cloud_src, cloud_src_h, "source", vp_2);
+
+  PCL_INFO ("Press q to continue the registration.\n");
+  p->spin ();
+
+  p->removePointCloud ("source"); 
+  p->removePointCloud ("target");
+
+  //add the source to the transformed target
+  *output += *cloud_src;
+ }
+
+
+/* ---[ */
+int main (int argc, char** argv)
+{
+  // Load data
+  std::vector<PCD, Eigen::aligned_allocator<PCD> > data;
+  loadData (argc, argv, data);
+
+  // Check user input
+  if (data.empty ())
+  {
+    PCL_ERROR ("Syntax is: %s <source.pcd> <target.pcd> [*]", argv[0]);
+    PCL_ERROR ("[*] - multiple files can be added. The registration results of (i, i+1) will be registered against (i+2), etc");
+    return (-1);
+  }
+  PCL_INFO ("Loaded %d datasets.", (int)data.size ());
+  
+  // Create a PCLVisualizer object
+  p = new pcl::visualization::PCLVisualizer (argc, argv, "Integration PCD");
+  p->createViewPort (0.0, 0, 0.5, 1.0, vp_1);
+  p->createViewPort (0.5, 0, 1.0, 1.0, vp_2);
+
+  PointCloud::Ptr source, target;
+  PointCloud::Ptr temp (new PointCloud);
+
+  for (size_t i = 1; i < data.size (); ++i)
+  {
+	if( i >= 2 ){	
+			source = data[i].cloud;
+			target = temp;
+	}else {
+			source = data[i].cloud;
+ 			target = data[i-1].cloud;
+	}
+	
+
+    
+    // Add visualization data
+    showCloudsLeft(source, target);
+	
+    PCL_INFO ("Aligning %s (%d) with %s (%d).\n", data[i-1].f_name.c_str (), source->points.size (), data[i].f_name.c_str (), target->points.size ());
+    pairAlign (source, target, temp, true);
+
+  }
+	std::stringstream ssTOT;
+   ssTOT << "totale.pcd";
+   pcl::io::savePCDFile (ssTOT.str (), *temp, true);
+}
+
+/*//Ogni volta ruoto il verde di questa matrice piu o meno sono simili
+Eigen::Matrix4f degree45;
+degree45 << 
+
+  0.72, 0.25, -0.64,  0.98,
+ -0.26, 0.96, 0.075, -0.12,
+  0.63, 0.11,  0.76,  0.35,
+     0,    0,     0,     1;
+
+ 0.723509  0.260841 -0.639135  0.971896
+-0.258199  0.960912 0.0998756 -0.149844
+ 0.640207  0.092763  0.762581  0.356931
+        0         0         0         1
+
+
+ 0.728822   0.235109  -0.643075   0.984237
+ -0.263034   0.963272   0.054066 -0.0856276
+  0.632166   0.129746   0.763894   0.359604
+         0          0          0          1
+
+0.683844  0.278036 -0.674577   1.02834
+-0.276423  0.954355  0.113129  -0.16876
+  0.67524  0.109107  0.729484  0.403861
+        0         0         0         1
+
+  0.77474  0.250618 -0.580491  0.894075
+-0.262268  0.962762 0.0656258 -0.113134
+ 0.575321    0.1014  0.811619  0.315639
+        0         0         0         1
+            //AsseX
+			degree45 <<   1,         0,         0,       0,
+						  0,  cos(-45), -sin(-45),       0,
+ 		      			  0,  sin(-45),  cos(-45),       0,
+  				          0,         0,         0,       1;
+            //AsseZ
+			degree45 <<   cos(-45), -sin(-45), 0, 0,
+						  sin(-45),  cos(-45), 0, 0,
+ 		      			         0,         0, 1, 0,
+  				                 0,         0, 0, 1;
+*/   
+/* ]--- */

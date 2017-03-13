@@ -1,0 +1,1 @@
+/home/parallels/Desktop/Reconstruction3D/KinectStream/build/CMakeFiles/kinectStream.dir
